@@ -17,8 +17,9 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 import PIL.Image
 import base64
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_openai import ChatOpenAI
+from langchain_chroma import Chroma
 
 
 env_path=find_dotenv(usecwd=True)
@@ -33,6 +34,15 @@ gemini_api_key=os.getenv("GEMINI_API_KEY")
 llm_img = ChatGoogleGenerativeAI( model="gemini-2.0-flash", google_api_key=gemini_api_key)
 llm_doc = ChatGoogleGenerativeAI( model="gemini-2.5-pro", google_api_key=gemini_api_key)
 folder_path = "/Users/ekushnir/Documents/Food/Eugene"
+chroma_db_path = "/Users/ekushnir/Documents/Food/Eugene/Database/chroma_db"
+
+# Initialize embeddings and persistent ChromaDB
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=gemini_api_key)
+vectorstore = Chroma(
+    collection_name="food_summaries",
+    embedding_function=embeddings,
+    persist_directory=chroma_db_path
+)
 
 def get_food_files(folder_path: str) -> dict:
     """
@@ -94,7 +104,7 @@ def get_nutrition_summary(image_path, llm):
     # 3. Create the multimodal message
     message = HumanMessage(
         content=[
-            {"type": "text", "text": "Analyze this food image. Create a detailed description of the food. Concetrate on portion whole portion size and ratio of ingredients. Also add how much input and output tokens have been used for that request"},
+            {"type": "text", "text": "Analyze this food image. Create a detailed description of the food. Concetrate on whole portion size and ratio of ingredients. "},
             {
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
@@ -108,17 +118,106 @@ def get_nutrition_summary(image_path, llm):
     return response.content
 
 
-summary = get_nutrition_summary("/Users/ekushnir/Documents/Food/Eugene/img_20260201174535.jpg", llm_img)
-print(summary)
-result = llm_img.invoke([HumanMessage(
-        content=[
-            {"type": "text", "text": f"Give me summary of that text: {summary}"}])])
-print(result.content)
+
+def process_food_entries(files_dict: dict, llm) -> dict:
+    """
+    Processes each entry in the food files dictionary.
+    
+    For each entry:
+    - Extracts the image path and runs it through get_nutrition_summary
+    - Reads the transcript file (if exists) into notes variable
+    - Stores the food summary in ChromaDB with metadata
+    
+    Args:
+        files_dict: Dictionary with timestamp keys and img/tr file paths as values
+        llm: The LLM model to use for nutrition summary
+    """
+    for identifier, files in files_dict.items():
+        image_path = files["img"]
+        tr_path = files["tr"]
+        
+        # Skip if no image exists
+        if not image_path:
+            continue
+        
+        # Get nutrition summary from image
+        nutrition_summary = get_nutrition_summary(image_path, llm)
+        
+        # Read transcript/notes if file exists
+        notes = None
+        if tr_path:
+            with open(tr_path, "r", encoding="utf-8") as f:
+                notes = f.read()
+        
+
+        food_summary = llm_img.invoke([HumanMessage(
+            content=[
+                {"type": "text", "text": f"Give me summary of that text: {nutrition_summary}, also combine them with these notes: {notes}. "
+                 f"Highlight in the beginning of the document depending on that timestamp {identifier} if it's breakfast(05:00-11:00), lunch(11:00-17:00) or dinner(17:00-05:00)."}])])
+
+        # Determine meal type from timestamp (HHMMSS portion)
+        time_part = identifier[8:12]  # Extract HHMM
+        hour = int(time_part[:2])
+        if 5 <= hour < 11:
+            meal_type = "breakfast"
+        elif 11 <= hour < 17:
+            meal_type = "lunch"
+        else:
+            meal_type = "dinner"
+        
+        # Extract date from timestamp (YYYYMMDD)
+        date_str = f"{identifier[:4]}-{identifier[4:6]}-{identifier[6:8]}"
+        
+        # Store in ChromaDB with metadata
+        vectorstore.add_texts(
+            texts=[food_summary.content],
+            metadatas=[{
+                "timestamp": identifier,
+                "date": date_str,
+                "meal_type": meal_type,
+                "person": "Eugene",
+                "image_path": image_path
+            }],
+            ids=[identifier]  # Use timestamp as unique ID
+        )
+        
+        print(f"Stored: {identifier} ({meal_type})")
 
 
+def get_all_food_entries():
+    """
+    Retrieves and prints all food entries stored in ChromaDB.
+    """
+    # Get all documents from the vectorstore
+    results = vectorstore.get()
+    
+    if not results["ids"]:
+        print("No entries found in ChromaDB")
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"Total entries in ChromaDB: {len(results['ids'])}")
+    print(f"{'='*60}\n")
+    
+    for i, (doc_id, document, metadata) in enumerate(zip(
+        results["ids"], 
+        results["documents"], 
+        results["metadatas"]
+    )):
+        print(f"--- Entry {i+1}: {doc_id} ---")
+        print(f"Date: {metadata.get('date', 'N/A')}")
+        print(f"Meal Type: {metadata.get('meal_type', 'N/A')}")
+        print(f"Person: {metadata.get('person', 'N/A')}")
+        print(f"Image: {metadata.get('image_path', 'N/A')}")
+        print(f"Summary: {document}")
+        print()
 
-dict=get_food_files(folder_path)
-print(dict)
+
+files_dict = get_food_files(folder_path)
+process_food_entries(files_dict, llm_img)
+get_all_food_entries()
+
+
 
 
 

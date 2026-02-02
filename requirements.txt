@@ -13,3 +13,4 @@ faiss-cpu
 pytz
 Pillow
 langchain-google-genai
+langchain_chroma
