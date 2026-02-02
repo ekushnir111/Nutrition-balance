@@ -108,9 +108,12 @@ def get_nutrition_summary(image_path, llm):
     return response.content
 
 
-summary = get_nutrition_summary("/Users/ekushnir/Documents/Food/Eugene/img_20260201174235.jpg", llm_img)
+summary = get_nutrition_summary("/Users/ekushnir/Documents/Food/Eugene/img_20260201174535.jpg", llm_img)
 print(summary)
-
+result = llm_doc.invoke([HumanMessage(
+        content=[
+            {"type": "text", "text": f"Give me summary of that text: {summary}"}])])
+print(result.content)
 
 
 
