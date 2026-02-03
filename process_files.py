@@ -1,223 +1,136 @@
-from IPython.display import Image, display
-from langgraph.prebuilt import ToolNode, tools_condition
-from typing_extensions import TypedDict
-from typing import Annotated
-from langgraph.graph import StateGraph, START, END
-from typing import Annotated
-from langgraph.graph.message import add_messages
-import os 
-from dotenv import load_dotenv, find_dotenv
-from langchain_openai import ChatOpenAI
-from langchain_groq import ChatGroq
-from langchain_core.messages import AIMessage,HumanMessage, AnyMessage, SystemMessage
-from pprint import pprint
-from langchain_community.tools import ArxivQueryRun,WikipediaQueryRun
-from langchain_community.utilities import WikipediaAPIWrapper,ArxivAPIWrapper
-from langchain_core.tools import tool
-from langgraph.checkpoint.memory import MemorySaver
-import PIL.Image
-import base64
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_openai import ChatOpenAI
-from langchain_chroma import Chroma
+#!/usr/bin/env python3
+# Food Processing Script - Enterprise Grade
+
+"""
+Main script for processing food images and storing summaries in ChromaDB.
+
+Usage:
+    python process_files.py [--person NAME]
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+from config import get_settings, configure_langchain
+from exceptions import NutritionBalanceError
+from services.file_service import FileService
+from services.food_processor import FoodProcessor
+from services.vectorstore_service import VectorStoreService
+from utils.logging_config import setup_logging, get_logger
 
 
-env_path=find_dotenv(usecwd=True)
-loaded=load_dotenv(dotenv_path=env_path, override=True)
-
-
-os.environ["LANGCHAIN_API_KEY"]=os.getenv("LANGCHAIN_API_KEY")
-os.environ["LANGCHAIN_TRACING_V2"]="true"
-os.environ["LANGCHAIN_PROJECT"]="Nutrition balance"
-gemini_api_key=os.getenv("GEMINI_API_KEY")
-
-llm_img = ChatGoogleGenerativeAI( model="gemini-2.0-flash", google_api_key=gemini_api_key)
-llm_doc = ChatGoogleGenerativeAI( model="gemini-2.5-pro", google_api_key=gemini_api_key)
-folder_path = "/Users/ekushnir/Documents/Food/Eugene"
-chroma_db_path = "/Users/ekushnir/Documents/Food/Eugene/Database/chroma_db"
-
-# Initialize embeddings and persistent ChromaDB
-embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=gemini_api_key)
-vectorstore = Chroma(
-    collection_name="food_summaries",
-    embedding_function=embeddings,
-    persist_directory=chroma_db_path
-)
-
-def get_food_files(folder_path: str) -> dict:
-    """
-    Reads files from a folder and organizes them by prefix (img/tr).
-    
-    Returns a dictionary where:
-    - Key: timestamp identifier (e.g., "20260201174235")
-    - Value: dict with "img" and "tr" keys containing file paths (or None if not present)
-    
-    Example return:
-    {
-        "20260201174235": {"img": "/path/to/img_20260201174235.jpg", "tr": "/path/to/tr_20260201174235.txt"},
-        "20260130123120": {"img": "/path/to/img_20260130123120.jpg", "tr": None}
-    }
-    """
-    files_dict = {}
-    
-    # Get all files in the folder
-    for filename in os.listdir(folder_path):
-        filepath = os.path.join(folder_path, filename)
-        
-        # Skip directories
-        if os.path.isdir(filepath):
-            continue
-        
-        # Extract prefix and identifier
-        if filename.startswith("img_"):
-            # Extract identifier (everything after "img_" and before extension)
-            identifier = filename[4:].rsplit(".", 1)[0]
-            if identifier not in files_dict:
-                files_dict[identifier] = {"img": None, "tr": None}
-            files_dict[identifier]["img"] = filepath
-            
-        elif filename.startswith("tr_"):
-            # Extract identifier (everything after "tr_" and before extension)
-            identifier = filename[3:].rsplit(".", 1)[0]
-            if identifier not in files_dict:
-                files_dict[identifier] = {"img": None, "tr": None}
-            files_dict[identifier]["tr"] = filepath
-    
-    return files_dict
-
-
-def get_images_without_transcript(files_dict: dict) -> list:
-    """Returns list of identifiers that have img but no associated tr file."""
-    return [id for id, files in files_dict.items() if files["img"] and not files["tr"]]
-
-
-def get_images_with_transcript(files_dict: dict) -> list:
-    """Returns list of identifiers that have both img and tr files."""
-    return [id for id, files in files_dict.items() if files["img"] and files["tr"]]
-
-def get_nutrition_summary(image_path, llm):
-
-    # 2. Encode image to Base64
-    with open(image_path, "rb") as image_file:
-        image_base64 = base64.b64encode(image_file.read()).decode("utf-8")
-
-    # 3. Create the multimodal message
-    message = HumanMessage(
-        content=[
-            {"type": "text", "text": "Analyze this food image. Create a detailed description of the food. Concetrate on whole portion size and ratio of ingredients. "},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
-            },
-        ]
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Process food images and store summaries in ChromaDB"
     )
+    parser.add_argument(
+        "--person",
+        type=str,
+        default=None,
+        help="Name of the person (overrides config default)"
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    return parser.parse_args()
 
-    # 4. Invoke the model
-    response = llm.invoke([message])
-    
-    return response.content
 
-
-
-def process_food_entries(files_dict: dict, llm) -> dict:
+def main() -> int:
     """
-    Processes each entry in the food files dictionary.
+    Main entry point for food processing.
     
-    For each entry:
-    - Extracts the image path and runs it through get_nutrition_summary
-    - Reads the transcript file (if exists) into notes variable
-    - Stores the food summary in ChromaDB with metadata
-    
-    Args:
-        files_dict: Dictionary with timestamp keys and img/tr file paths as values
-        llm: The LLM model to use for nutrition summary
+    Returns:
+        Exit code (0 for success, 1 for error)
     """
-    for identifier, files in files_dict.items():
-        image_path = files["img"]
-        tr_path = files["tr"]
+    args = parse_args()
+    
+    # Setup logging
+    import logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    setup_logging(level=log_level)
+    logger = get_logger(__name__)
+    
+    try:
+        # Load configuration
+        logger.info("Loading configuration...")
+        settings = get_settings()
+        configure_langchain(settings)
         
-        # Skip if no image exists
-        if not image_path:
-            continue
+        # Override person if provided via CLI
+        person = args.person or settings.default_person
         
-        # Get nutrition summary from image
-        nutrition_summary = get_nutrition_summary(image_path, llm)
+        # Initialize services
+        logger.info("Initializing services...")
         
-        # Read transcript/notes if file exists
-        notes = None
-        if tr_path:
-            with open(tr_path, "r", encoding="utf-8") as f:
-                notes = f.read()
-        
-
-        food_summary = llm_img.invoke([HumanMessage(
-            content=[
-                {"type": "text", "text": f"Give me summary of that text: {nutrition_summary}, also combine them with these notes: {notes}. "
-                 f"Highlight in the beginning of the document depending on that timestamp {identifier} if it's breakfast(05:00-11:00), lunch(11:00-17:00) or dinner(17:00-05:00)."}])])
-
-        # Determine meal type from timestamp (HHMMSS portion)
-        time_part = identifier[8:12]  # Extract HHMM
-        hour = int(time_part[:2])
-        if 5 <= hour < 11:
-            meal_type = "breakfast"
-        elif 11 <= hour < 17:
-            meal_type = "lunch"
-        else:
-            meal_type = "dinner"
-        
-        # Extract date from timestamp (YYYYMMDD)
-        date_str = f"{identifier[:4]}-{identifier[4:6]}-{identifier[6:8]}"
-        
-        # Store in ChromaDB with metadata
-        vectorstore.add_texts(
-            texts=[food_summary.content],
-            metadatas=[{
-                "timestamp": identifier,
-                "date": date_str,
-                "meal_type": meal_type,
-                "person": "Eugene",
-                "image_path": image_path
-            }],
-            ids=[identifier]  # Use timestamp as unique ID
+        llm = ChatGoogleGenerativeAI(
+            model=settings.llm_image_model,
+            google_api_key=settings.gemini_api_key
         )
         
-        print(f"Stored: {identifier} ({meal_type})")
+        file_service = FileService(settings.food_folder_path)
+        food_processor = FoodProcessor(llm)
+        vectorstore = VectorStoreService(
+            persist_directory=settings.chroma_db_path,
+            collection_name=settings.collection_name,
+            api_key=settings.gemini_api_key,
+            embedding_model=settings.embedding_model
+        )
+        
+        # Scan for food files
+        logger.info(f"Scanning folder: {settings.food_folder_path}")
+        entries = file_service.scan_food_files()
+        
+        if not entries:
+            logger.warning("No food files found")
+            return 0
+        
+        # Process each entry
+        processed_count = 0
+        for identifier, file_entry in entries.items():
+            if not file_entry.has_image:
+                logger.debug(f"Skipping {identifier}: no image")
+                continue
+            
+            # Read transcript if available
+            notes = None
+            if file_entry.has_transcript:
+                notes = file_service.read_transcript(file_entry.transcript_path)
+            
+            # Process the food entry
+            logger.info(f"Processing: {identifier}")
+            food_entry = food_processor.process_food_entry(
+                identifier=identifier,
+                image_path=file_entry.image_path,
+                notes=notes,
+                person=person
+            )
+            
+            # Store in vector database
+            vectorstore.add_entry(food_entry)
+            processed_count += 1
+        
+        # Summary
+        logger.info(f"Processing complete. Stored {processed_count} entries.")
+        logger.info(f"Total entries in database: {vectorstore.count}")
+        
+        return 0
+        
+    except NutritionBalanceError as e:
+        logger.error(f"Processing error: {e}")
+        return 1
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        return 1
 
 
-def get_all_food_entries():
-    """
-    Retrieves and prints all food entries stored in ChromaDB.
-    """
-    # Get all documents from the vectorstore
-    results = vectorstore.get()
-    
-    if not results["ids"]:
-        print("No entries found in ChromaDB")
-        return
-    
-    print(f"\n{'='*60}")
-    print(f"Total entries in ChromaDB: {len(results['ids'])}")
-    print(f"{'='*60}\n")
-    
-    for i, (doc_id, document, metadata) in enumerate(zip(
-        results["ids"], 
-        results["documents"], 
-        results["metadatas"]
-    )):
-        print(f"--- Entry {i+1}: {doc_id} ---")
-        print(f"Date: {metadata.get('date', 'N/A')}")
-        print(f"Meal Type: {metadata.get('meal_type', 'N/A')}")
-        print(f"Person: {metadata.get('person', 'N/A')}")
-        print(f"Image: {metadata.get('image_path', 'N/A')}")
-        print(f"Summary: {document}")
-        print()
-
-
-files_dict = get_food_files(folder_path)
-process_food_entries(files_dict, llm_img)
-get_all_food_entries()
-
-
-
-
-
+if __name__ == "__main__":
+    sys.exit(main())
