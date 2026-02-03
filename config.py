@@ -24,7 +24,7 @@ class Settings:
     
     # Paths
     food_folder_path: Path = field(default_factory=lambda: Path("/Users/ekushnir/Documents/Food/Eugene"))
-    chroma_db_path: Path = field(default_factory=lambda: Path("/Users/ekushnir/Documents/Food/Eugene/Database/chroma_db"))
+    chroma_db_path: Path = field(default_factory=lambda: Path("/Users/ekushnir/Documents/Food/Database/food_db"))
     
     # Model settings
     llm_image_model: str = "gemini-2.0-flash"
