@@ -25,7 +25,7 @@ class VectorStoreService:
         persist_directory: Path,
         collection_name: str,
         api_key: str,
-        embedding_model: str = "models/embedding-001"
+        embedding_model: str = "models/gemini-embedding-001"
     ):
         """
         Initialize the vector store service.

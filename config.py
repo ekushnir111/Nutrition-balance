@@ -29,7 +29,7 @@ class Settings:
     # Model settings
     llm_image_model: str = "gemini-2.0-flash"
     llm_doc_model: str = "gemini-2.5-pro"
-    embedding_model: str = "models/embedding-001"
+    embedding_model: str = "models/gemini-embedding-001"
     
     # ChromaDB settings
     collection_name: str = "food_summaries"
